@@ -1,12 +1,17 @@
-from datetime import datetime
-from flask import Flask, request, render_template, jsonify
-from flask.ext.login import current_user, login_required
+import logging
+
+from flask import Flask, jsonify, redirect, render_template, request, url_for
+from flask.ext.login import LoginManager, current_user, login_user, login_required, logout_user
 from flask.ext.sqlalchemy import SQLAlchemy
 from flask_oauthlib.provider import OAuth2Provider
 from sqlalchemy import Column, DateTime, Integer, String, Boolean
-from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, synonym
 from werkzeug.security import generate_password_hash, check_password_hash
+
+"""Forms to render HTML input & validate request data."""
+from wtforms import Form, PasswordField, StringField
+from wtforms.validators import required
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 oauth = OAuth2Provider(app)
@@ -15,7 +20,39 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///op.db'
 app.config['SECRET_KEY'] = 'enydM2ANhdcoKwdVa0jWvEsbPFuQpMjf'
 
 db = SQLAlchemy(app)
-db.Model = declarative_base()
+
+logger1 = logging.getLogger('flask_oauthlib')
+logger2 = logging.getLogger('oauthlib')
+logger1.setLevel(logging.DEBUG)
+logger2.setLevel(logging.DEBUG)
+file_handler1 = logging.FileHandler('flask_oauthlib.log')
+file_handler2 = logging.FileHandler('oauthlib.log')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s = %(message)s')
+file_handler1.setFormatter(formatter)
+file_handler2.setFormatter(formatter)
+
+logger1.addHandler(file_handler1)
+logger2.addHandler(file_handler2)
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Please log in to see your appointments.'
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    """Hook for Flask-Login to load a User instance from a user ID."""
+    return User.query.get(user_id)
+
+
+class LoginForm(Form):
+    """Render HTML input for user login form.
+
+    Authentication (i.e. password verification) happens in the view function.
+    """
+    username = StringField('Username', [required()])
+    password = PasswordField('Password', [required()])
 
 
 class Client(db.Model):
@@ -32,8 +69,7 @@ class Client(db.Model):
     user = relationship('User')
 
     client_id = db.Column(db.Unicode(40), primary_key=True)
-    client_secret = db.Column(db.Unicode(55), unique=True, index=True,
-                              nullable=False)
+    client_secret = db.Column(db.Unicode(55), unique=True, index=True, nullable=False)
 
     # public or confidential
     is_confidential = db.Column(db.Boolean)
@@ -67,12 +103,13 @@ class Client(db.Model):
 class User(db.Model):
     __tablename__ = 'user'
     id = Column(Integer, primary_key=True)
-    created = Column(DateTime, default=datetime.now)
-    modified = Column(DateTime, default=datetime.now, onupdate=datetime.now)
     name = Column('name', String(200))
     email = Column(String(100), unique=True, nullable=False)
     active = Column(Boolean, default=True)
     _password = Column('password', String(100))
+
+    created = Column(DateTime, default=datetime.now)
+    modified = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
     def _get_password(self):
         return self._password
@@ -96,7 +133,7 @@ class User(db.Model):
     @classmethod
     def authenticate(cls, query, email, password):
         email = email.strip().lower()
-        user = query(cls).filter(cls.email==email).first()
+        user = query(cls).filter(cls.email == email).first()
         if user is None:
             return None, False
         if not user.active:
@@ -124,15 +161,10 @@ class Grant(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
 
-    user_id = db.Column(
-        db.Integer, db.ForeignKey('user.id', ondelete='CASCADE')
-    )
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='CASCADE'))
     user = relationship('User')
 
-    client_id = db.Column(
-        db.Unicode(40), db.ForeignKey('client.client_id'),
-        nullable=False,
-    )
+    client_id = db.Column(db.Unicode(40), db.ForeignKey('client.client_id'), nullable=False, )
     client = relationship('Client')
 
     code = db.Column(db.Unicode(255), index=True, nullable=False)
@@ -183,13 +215,25 @@ class Token(db.Model):
             return self._scopes.split()
         return []
 
+    def _get_scope(self):
+        if self._scopes:
+            return self._scopes.split()
+        return []
+
+    def _set_scope(self, scope):
+        if scope:
+            scope = scope
+        self._scopes = scope
+
+    scope_descriptor = property(_get_scope, _set_scope)
+    scope = synonym('_scopes', descriptor=scope_descriptor)
+
 
 @oauth.clientgetter
 def load_client(client_id):
+    # return Client.query.filter_by(client_id=client_id).first()
     return Client.query.filter_by(client_id=client_id).first()
 
-
-from datetime import datetime, timedelta
 
 @oauth.grantgetter
 def load_grant(client_id, code):
@@ -197,7 +241,7 @@ def load_grant(client_id, code):
 
 
 def get_current_user():
-    return db.session.query(User).get(current_user.id)
+    return User.query.get(current_user.id)
 
 
 @oauth.grantsetter
@@ -224,14 +268,13 @@ def load_token(access_token=None, refresh_token=None):
     elif refresh_token:
         return Token.query.filter_by(refresh_token=refresh_token).first()
 
-from datetime import datetime, timedelta
 
 @oauth.tokensetter
 def save_token(token, request, *args, **kwargs):
-    toks = Token.query.filter_by(client_id=request.client.client_id,
-                                 user_id=request.user.id)
+    # toks = Token.query.filter_by(client_id=request.client.client_id, user_id=request.user.id).all()
     # make sure that every client has only one token connected to a user
-    db.session.delete(toks)
+    # for tok in toks:
+    #     db.session.delete(tok)
 
     expires_in = token.pop('expires_in')
     expires = datetime.utcnow() + timedelta(seconds=expires_in)
@@ -239,18 +282,23 @@ def save_token(token, request, *args, **kwargs):
     tok = Token(**token)
     tok.expires = expires
     tok.client_id = request.client.client_id
-    tok.user_id = request.user.id
+
+    if not request.user:
+        tok.user_id = current_user.id
+    else:
+        tok.user_id = request.user.id
+
     db.session.add(tok)
     db.session.commit()
     return tok
 
+
 @oauth.usergetter
 def get_user(username, password, *args, **kwargs):
-    user = User.query.filter_by(username=username).first()
+    user = User.query.filter_by(email=username).first()
     if user.check_password(password):
         return user
     return None
-
 
 
 @app.route('/oauth/authorize', methods=['GET', 'POST'])
@@ -267,7 +315,7 @@ def authorize(*args, **kwargs):
     return confirm == 'yes'
 
 
-@app.route('/oauth/token')
+@app.route('/oauth/token', methods=['GET', 'POST'])
 @oauth.token_handler
 def access_token():
     return None
@@ -275,30 +323,63 @@ def access_token():
 
 @app.route('/api/me')
 @oauth.require_oauth('email')
-def me(request):
-    user = request.user
-    return jsonify(email=user.email, username=user.username)
+def me():
+    user = request.oauth.user
+    return jsonify(email=user.email, username=user.name)
 
-@app.route('/api/user/<username>')
+
+@app.route('/api/user/<email>')
 @oauth.require_oauth('email')
-def user(request, username):
-    user = User.query.filter_by(username=username).first()
-    return jsonify(email=user.email, username=user.username)
+def user(email):
+    user = User.query.filter_by(email=email).first()
+    return jsonify(email=user.email, username=user.name)
+
+
+@app.route('/api/sample')
+@oauth.require_oauth('email')
+def sample():
+    email = request.oauth.user.email
+    return jsonify({'hello': email})
+
+
+@app.route('/login/', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated():
+        return redirect(url_for('index'))
+    form = LoginForm(request.form)
+    error = None
+    if request.method == 'POST' and form.validate():
+        email = form.username.data.lower().strip()
+        password = form.password.data.lower().strip()
+        user, authenticated = User.authenticate(db.session.query, email, password)
+        if authenticated:
+            login_user(user)
+            return redirect(request.args.get("next") or url_for("authorize"))
+        else:
+            error = 'Incorrect username or password. Try again.'
+    return render_template('user/login.html', form=form, error=error)
+
+
+@app.route('/logout/')
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+
+@app.route('/')
+def index():
+    return 'Hello, %s' % (current_user.name if current_user else 'world')
 
 
 if __name__ == '__main__':
-    #from datetime import timedelta
+    # from datetime import timedelta
 
     from sqlalchemy import create_engine
-    #from sqlalchemy.orm import sessionmaker
+    # from sqlalchemy.orm import sessionmaker
 
     engine = create_engine('sqlite:///op.db', echo=True)
     db.Model.metadata.create_all(engine)
 
-    user = User(name='Pyunghyuk Yoo',
-                email='yoophi@gmail.com',
-                password='secret')
-    #Session = sessionmaker(bind=engine)
-    #session = Session()
+    user = User(name='Pyunghyuk Yoo', email='yoophi@gmail.com', password='secret')
     db.session.add(user)
     db.session.commit()
